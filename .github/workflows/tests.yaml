@@ -1,25 +1,14 @@
 name: Tests
 on:
-  push:
-    branches:
-      - main
-      - '*.x'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - '*.rst'
-  pull_request:
-    branches:
-      - main
-      - '*.x'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - '*.rst'
+  # Fork build: dispatched explicitly; push/pull_request would fire unbidden
+  # on every fork sync.
+  workflow_dispatch:
+
 jobs:
   tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +20,8 @@ jobs:
           - {name: '3.10', python: '3.10', os: ubuntu-latest, tox: py310}
           - {name: '3.9', python: '3.9', os: ubuntu-latest, tox: py39}
           - {name: '3.8', python: '3.8', os: ubuntu-latest, tox: py38}
-          - {name: '3.7', python: '3.7', os: ubuntu-latest, tox: py37}
+          # setup-python has no 3.7 build for ubuntu-24.04 (= ubuntu-latest).
+          - {name: '3.7', python: '3.7', os: ubuntu-22.04, tox: py37}
           - {name: 'PyPy', python: 'pypy-3.10', os: ubuntu-latest, tox: pypy310}
           - {name: Typing, python: '3.11', os: ubuntu-latest, tox: typing}
     steps:
@@ -47,7 +37,10 @@ jobs:
           pip install -U setuptools
           python -m pip install -U pip
       - name: cache mypy
-        uses: actions/cache@58c146cc91c5b9e778e71775dfe9bf1442ad9a12
+        # v3 (58c146c) is auto-failed by GitHub at the "Prepare all required
+        # actions" phase, which kills every matrix leg regardless of the `if:`
+        # guard below, since action download precedes `if:` evaluation.
+        uses: actions/cache@v4
         with:
           path: ./.mypy_cache
           key: mypy|${{ matrix.python }}|${{ hashFiles('setup.cfg') }}
