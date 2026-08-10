@@ -6,6 +6,7 @@ placed in this module and only imported as needed.
 import contextlib
 import math
 import os
+import shlex
 import sys
 import time
 import typing as t
@@ -358,7 +359,22 @@ class ProgressBar(t.Generic[V]):
 
 
 def pager(generator: t.Iterable[str], color: t.Optional[bool] = None) -> None:
-    """Decide what method to use for paging through text."""
+    """Decide what method to use for paging through text.
+
+    The ``PAGER`` environment variable is split into an ``argv`` list with
+    :func:`shlex.split` in its default POSIX mode so that quotes are
+    stripped from tokens and quoted Windows paths are preserved. The parts
+    are handed to :mod:`subprocess` without a shell, so the value can't be
+    used to inject additional commands.
+
+    .. note::
+        ``posix=False`` was considered but rejected because it retains
+        quote characters in tokens. The :func:`shlex.quote` approach was
+        also reverted in :pr:`1543`.
+
+    .. seealso::
+        :issue:`1026`, :pr:`1477` and :pr:`2775`.
+    """
     stdout = _default_text_stdout()
 
     # There are no standard streams attached to write to. For example,
@@ -368,17 +384,19 @@ def pager(generator: t.Iterable[str], color: t.Optional[bool] = None) -> None:
 
     if not isatty(sys.stdin) or not isatty(stdout):
         return _nullpager(stdout, generator, color)
-    pager_cmd = (os.environ.get("PAGER", None) or "").strip()
-    if pager_cmd:
+
+    # Split and normalize the pager command into parts.
+    pager_cmd_parts = shlex.split(os.environ.get("PAGER", ""))
+    if pager_cmd_parts:
         if WIN:
-            return _tempfilepager(generator, pager_cmd, color)
-        return _pipepager(generator, pager_cmd, color)
+            return _tempfilepager(generator, pager_cmd_parts, color)
+        return _pipepager(generator, pager_cmd_parts, color)
     if os.environ.get("TERM") in ("dumb", "emacs"):
         return _nullpager(stdout, generator, color)
     if WIN or sys.platform.startswith("os2"):
-        return _tempfilepager(generator, "more <", color)
+        return _tempfilepager(generator, ["more"], color)
     if hasattr(os, "system") and os.system("(less) 2>/dev/null") == 0:
-        return _pipepager(generator, "less", color)
+        return _pipepager(generator, ["less"], color)
 
     import tempfile
 
@@ -386,32 +404,49 @@ def pager(generator: t.Iterable[str], color: t.Optional[bool] = None) -> None:
     os.close(fd)
     try:
         if hasattr(os, "system") and os.system(f'more "{filename}"') == 0:
-            return _pipepager(generator, "more", color)
+            return _pipepager(generator, ["more"], color)
         return _nullpager(stdout, generator, color)
     finally:
         os.unlink(filename)
 
 
-def _pipepager(generator: t.Iterable[str], cmd: str, color: t.Optional[bool]) -> None:
+def _pipepager(
+    generator: t.Iterable[str], cmd_parts: t.List[str], color: t.Optional[bool]
+) -> None:
     """Page through text by feeding it to another program.  Invoking a
     pager through this might support colors.
+
+    The pager is invoked with :class:`subprocess.Popen` using the ``argv``
+    list produced by :func:`shlex.split` rather than a shell command
+    string, so the ``PAGER`` environment variable can't be used to inject
+    additional commands. If the command can't be started, the text is
+    printed unpaged instead of raising.
     """
     import subprocess
 
     env = dict(os.environ)
 
+    # Split the command into the invoked CLI and its parameters.
+    cmd_name = cmd_parts[0].rsplit("/", 1)[-1]
+    cmd_params = cmd_parts[1:]
+
     # If we're piping to less we might support colors under the
     # condition that
-    cmd_detail = cmd.rsplit("/", 1)[-1].split()
-    if color is None and cmd_detail[0] == "less":
-        less_flags = f"{os.environ.get('LESS', '')}{' '.join(cmd_detail[1:])}"
+    if color is None and cmd_name == "less":
+        less_flags = f"{os.environ.get('LESS', '')}{' '.join(cmd_params)}"
         if not less_flags:
             env["LESS"] = "-R"
             color = True
         elif "r" in less_flags or "R" in less_flags:
             color = True
 
-    c = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, env=env)
+    try:
+        c = subprocess.Popen(cmd_parts, shell=False, stdin=subprocess.PIPE, env=env)
+    except OSError:
+        # Command not found or not executable. Without a shell to report
+        # the error, fall back to printing the text so it isn't lost.
+        return _nullpager(sys.stdout, generator, color)
+
     stdin = t.cast(t.BinaryIO, c.stdin)
     encoding = get_best_encoding(stdin)
     try:
@@ -443,9 +478,17 @@ def _pipepager(generator: t.Iterable[str], cmd: str, color: t.Optional[bool]) ->
 
 
 def _tempfilepager(
-    generator: t.Iterable[str], cmd: str, color: t.Optional[bool]
+    generator: t.Iterable[str], cmd_parts: t.List[str], color: t.Optional[bool]
 ) -> None:
-    """Page through text by invoking a program on a temporary file."""
+    """Page through text by invoking a program on a temporary file.
+
+    The pager is invoked with :func:`subprocess.call` using the ``argv``
+    list produced by :func:`shlex.split` rather than a shell command
+    string, so the ``PAGER`` environment variable can't be used to inject
+    additional commands. If the command can't be started, the text is
+    printed unpaged instead of being discarded.
+    """
+    import subprocess
     import tempfile
 
     fd, filename = tempfile.mkstemp()
@@ -457,7 +500,11 @@ def _tempfilepager(
     with open_stream(filename, "wb")[0] as f:
         f.write(text.encode(encoding))
     try:
-        os.system(f'{cmd} "{filename}"')
+        subprocess.call(cmd_parts + [filename])
+    except OSError:
+        # Command not found or not executable. Print the collected text so
+        # it isn't lost.
+        _nullpager(sys.stdout, iter([text]), color)
     finally:
         os.close(fd)
         os.unlink(filename)
@@ -501,6 +548,17 @@ class Editor:
         return "vi"
 
     def edit_file(self, filename: str) -> None:
+        """Open a file in the user's editor.
+
+        The editor command is split into an ``argv`` list with
+        :func:`shlex.split` in POSIX mode and handed to :mod:`subprocess`
+        without a shell; see :func:`pager` for the rationale. The
+        ``VISUAL``/``EDITOR`` environment variables therefore can't be
+        used to inject additional commands.
+
+        .. seealso::
+            :issue:`1026` and :pr:`1477`.
+        """
         import subprocess
 
         editor = self.get_editor()
@@ -511,7 +569,7 @@ class Editor:
             environ.update(self.env)
 
         try:
-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+            c = subprocess.Popen(args=shlex.split(editor) + [filename], env=environ)
             exit_code = c.wait()
             if exit_code != 0:
                 raise ClickException(
